@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@notionhq/client";
-import cheerio from "cheerio";
+import { load as loadHtml } from "cheerio";
 
 const REQUIRED_ENV_VARS = [
   "NOTION_TOKEN",
@@ -20,6 +20,30 @@ const USER_AGENT =
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const STATE_FILE_PATH = path.resolve(__dirname, "..", "seen_jobs.json");
+const DEBUG_INGEST_ENDPOINT = "http://127.0.0.1:7684/ingest/74cc1cfb-b75f-4990-9811-1f44bafe5045";
+const DEBUG_SESSION_ID = "e13dca";
+const DEBUG_RUN_ID = process.env.GITHUB_RUN_ID || "local-run";
+
+function debugLog(hypothesisId, location, message, data = {}) {
+  // #region agent log
+  fetch(DEBUG_INGEST_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": DEBUG_SESSION_ID
+    },
+    body: JSON.stringify({
+      sessionId: DEBUG_SESSION_ID,
+      runId: DEBUG_RUN_ID,
+      hypothesisId,
+      location,
+      message,
+      data,
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
+}
 
 function assertEnv() {
   const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
@@ -162,7 +186,7 @@ function roleKey(role) {
 }
 
 function extractCandidateRoles(company, careersUrl, html) {
-  const $ = cheerio.load(html);
+  const $ = loadHtml(html);
   const results = [];
   $("a").each((_, element) => {
     const title = $(element).text().replace(/\s+/g, " ").trim();
@@ -245,7 +269,14 @@ async function sendDiscordNotification(newRoles, errors) {
 }
 
 async function run() {
+  debugLog("H1", "src/index.js:273", "Monitor run entered", { nodeVersion: process.version });
   assertEnv();
+  debugLog("H2", "src/index.js:275", "Environment validation passed", {
+    hasNotionToken: Boolean(process.env.NOTION_TOKEN),
+    hasCompaniesDb: Boolean(process.env.NOTION_COMPANIES_DB_ID),
+    hasAppsDb: Boolean(process.env.NOTION_APPS_DB_ID),
+    hasDiscordWebhook: Boolean(process.env.DISCORD_WEBHOOK_URL)
+  });
   const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
   console.log("Loading companies and applications from Notion...");
@@ -254,6 +285,11 @@ async function run() {
     loadApplicationKeys(notion),
     loadSeenState()
   ]);
+  debugLog("H3", "src/index.js:288", "Loaded Notion and state payload sizes", {
+    companiesCount: companies.length,
+    appliedKeysCount: appliedKeys.size,
+    seenKeysCount: seenKeys.size
+  });
   console.log(`Loaded ${companies.length} companies.`);
   console.log(`Loaded ${appliedKeys.size} application keys and ${seenKeys.size} seen keys.`);
 
@@ -284,6 +320,10 @@ async function run() {
   await saveSeenState(seenKeys);
 
   if (trulyNew.length > 0) {
+    debugLog("H4", "src/index.js:322", "Preparing Discord alert for new roles", {
+      newRolesCount: trulyNew.length,
+      scrapeErrorCount: errors.length
+    });
     await sendDiscordNotification(trulyNew, errors);
     console.log(`Sent Discord alert for ${trulyNew.length} new roles.`);
   } else {
@@ -296,6 +336,10 @@ async function run() {
 }
 
 run().catch((error) => {
+  debugLog("H5", "src/index.js:336", "Monitor run failed", {
+    errorMessage: String(error?.message || error),
+    errorName: error?.name || "UnknownError"
+  });
   console.error("Internship monitor failed:", error);
   process.exit(1);
 });
