@@ -11,7 +11,29 @@ const REQUIRED_ENV_VARS = [
   "DISCORD_WEBHOOK_URL"
 ];
 
-const KEYWORDS = ["intern", "internship", "co-op", "coop"];
+const INTERNSHIP_KEYWORDS = ["intern", "internship", "co-op", "coop"];
+const TECH_KEYWORDS = [
+  "software",
+  "swe",
+  "engineer",
+  "engineering",
+  "developer",
+  "frontend",
+  "backend",
+  "full stack",
+  "fullstack",
+  "data",
+  "machine learning",
+  "ml",
+  "ai",
+  "electrical",
+  "eecs",
+  "computer science",
+  "embedded",
+  "firmware",
+  "systems"
+];
+const TITLE_SIMILARITY_THRESHOLD = 0.5;
 const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RETRIES = 2;
 const USER_AGENT =
@@ -20,30 +42,6 @@ const USER_AGENT =
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const STATE_FILE_PATH = path.resolve(__dirname, "..", "seen_jobs.json");
-const DEBUG_INGEST_ENDPOINT = "http://127.0.0.1:7684/ingest/74cc1cfb-b75f-4990-9811-1f44bafe5045";
-const DEBUG_SESSION_ID = "e13dca";
-const DEBUG_RUN_ID = process.env.GITHUB_RUN_ID || "local-run";
-
-function debugLog(hypothesisId, location, message, data = {}) {
-  // #region agent log
-  fetch(DEBUG_INGEST_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": DEBUG_SESSION_ID
-    },
-    body: JSON.stringify({
-      sessionId: DEBUG_SESSION_ID,
-      runId: DEBUG_RUN_ID,
-      hypothesisId,
-      location,
-      message,
-      data,
-      timestamp: Date.now()
-    })
-  }).catch(() => {});
-  // #endregion
-}
 
 function assertEnv() {
   const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
@@ -71,6 +69,25 @@ function canonicalizeUrl(url) {
   } catch {
     return (url || "").trim();
   }
+}
+
+function tokenize(value) {
+  return new Set(
+    normalizeText(value)
+      .split(" ")
+      .map((token) => token.trim())
+      .filter(Boolean)
+  );
+}
+
+function jaccardSimilarity(tokensA, tokensB) {
+  if (tokensA.size === 0 || tokensB.size === 0) return 0;
+  let intersection = 0;
+  for (const token of tokensA) {
+    if (tokensB.has(token)) intersection += 1;
+  }
+  const union = new Set([...tokensA, ...tokensB]).size;
+  return union === 0 ? 0 : intersection / union;
 }
 
 function chunk(list, size) {
@@ -142,7 +159,7 @@ async function queryAllRows(notion, databaseId) {
 
 async function loadCompanies(notion) {
   const rows = await queryAllRows(notion, process.env.NOTION_COMPANIES_DB_ID);
-  const companies = rows
+  return rows
     .map((row) => {
       const company = getTitleProperty(row.properties);
       const careersUrl =
@@ -152,37 +169,73 @@ async function loadCompanies(notion) {
       return { company, careersUrl };
     })
     .filter((item) => item.company && item.careersUrl);
-  return companies;
 }
 
-function applicationKeysFromRow(row) {
+function applicationEntryFromRow(row) {
   const title = getTitleProperty(row.properties) || getRichText(row.properties, ["role", "position", "title"]);
   const company = getRichText(row.properties, ["company"]);
   const jobUrl = getRichText(row.properties, ["job", "posting", "url", "link"]);
-  const keys = new Set();
-  const normalizedTitle = normalizeText(title);
-  const normalizedCompany = normalizeText(company);
-  if (normalizedTitle && normalizedCompany) keys.add(`${normalizedCompany}|${normalizedTitle}`);
-  if (jobUrl) keys.add(canonicalizeUrl(jobUrl));
-  return keys;
+  return {
+    normalizedTitle: normalizeText(title),
+    normalizedCompany: normalizeText(company),
+    canonicalUrl: jobUrl ? canonicalizeUrl(jobUrl) : "",
+    titleTokens: tokenize(title)
+  };
 }
 
-async function loadApplicationKeys(notion) {
-  const rows = await queryAllRows(notion, process.env.NOTION_APPS_DB_ID);
-  const applied = new Set();
+function buildApplicationsIndex(rows) {
+  const byUrl = new Set();
+  const byCompanyAndTitle = new Set();
+  const entries = [];
+
   for (const row of rows) {
-    for (const key of applicationKeysFromRow(row)) applied.add(key);
+    const entry = applicationEntryFromRow(row);
+    if (entry.canonicalUrl) byUrl.add(entry.canonicalUrl);
+    if (entry.normalizedCompany && entry.normalizedTitle) {
+      byCompanyAndTitle.add(`${entry.normalizedCompany}|${entry.normalizedTitle}`);
+    }
+    entries.push(entry);
   }
-  return applied;
+
+  return { byUrl, byCompanyAndTitle, entries };
+}
+
+async function loadApplicationsIndex(notion) {
+  const rows = await queryAllRows(notion, process.env.NOTION_APPS_DB_ID);
+  return buildApplicationsIndex(rows);
 }
 
 function containsInternKeyword(text) {
   const lower = (text || "").toLowerCase();
-  return KEYWORDS.some((keyword) => lower.includes(keyword));
+  return INTERNSHIP_KEYWORDS.some((keyword) => lower.includes(keyword));
+}
+
+function containsTechKeyword(text) {
+  const lower = (text || "").toLowerCase();
+  return TECH_KEYWORDS.some((keyword) => lower.includes(keyword));
+}
+
+function isTargetRoleTitle(text) {
+  return containsInternKeyword(text) && containsTechKeyword(text);
 }
 
 function roleKey(role) {
   return `${normalizeText(role.company)}|${normalizeText(role.title)}|${canonicalizeUrl(role.url)}`;
+}
+
+function isLikelyAppliedRole(role, applicationsIndex) {
+  const roleUrl = canonicalizeUrl(role.url);
+  const roleCompany = normalizeText(role.company);
+  const roleTitle = normalizeText(role.title);
+  if (applicationsIndex.byUrl.has(roleUrl)) return true;
+  if (applicationsIndex.byCompanyAndTitle.has(`${roleCompany}|${roleTitle}`)) return true;
+
+  const roleTokens = tokenize(role.title);
+  for (const entry of applicationsIndex.entries) {
+    if (!entry.normalizedCompany || entry.normalizedCompany !== roleCompany) continue;
+    if (jaccardSimilarity(roleTokens, entry.titleTokens) >= TITLE_SIMILARITY_THRESHOLD) return true;
+  }
+  return false;
 }
 
 function extractCandidateRoles(company, careersUrl, html) {
@@ -192,7 +245,7 @@ function extractCandidateRoles(company, careersUrl, html) {
     const title = $(element).text().replace(/\s+/g, " ").trim();
     const href = $(element).attr("href");
     if (!title || !href) return;
-    if (!containsInternKeyword(title)) return;
+    if (!isTargetRoleTitle(title)) return;
     const absolute = new URL(href, careersUrl).toString();
     results.push({ company, title, url: absolute });
   });
@@ -217,6 +270,16 @@ async function scrapeCompanyJobs(company) {
   }
 }
 
+function summarizeScrapeResults(scrapeResults) {
+  const totalCompanies = scrapeResults.length;
+  const failed = scrapeResults
+    .filter((item) => item.error)
+    .map((item) => ({ company: item.company, reason: item.error }));
+  const failedCompanies = failed.length;
+  const successfulCompanies = totalCompanies - failedCompanies;
+  return { totalCompanies, successfulCompanies, failedCompanies, failed };
+}
+
 async function loadSeenState() {
   try {
     const raw = await fs.readFile(STATE_FILE_PATH, "utf8");
@@ -236,30 +299,61 @@ async function saveSeenState(seenSet) {
   await fs.writeFile(STATE_FILE_PATH, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
-function formatDiscordLines(roles) {
+function trimLines(lines, maxChars = 1900) {
+  const kept = [];
+  let total = 0;
+  for (const line of lines) {
+    const nextLength = line.length + 1;
+    if (total + nextLength > maxChars) break;
+    kept.push(line);
+    total += nextLength;
+  }
+  return kept;
+}
+
+function buildRunSummary(newRolesCount, scrapeSummary) {
+  return [
+    "Run summary:",
+    `- New roles: ${newRolesCount}`,
+    `- Scrape success: ${scrapeSummary.successfulCompanies}/${scrapeSummary.totalCompanies}`,
+    `- Scrape failures: ${scrapeSummary.failedCompanies}`
+  ];
+}
+
+function formatFailureLines(scrapeSummary) {
+  if (scrapeSummary.failed.length === 0) return [];
+  const lines = ["", "Failed scrapes:"];
+  for (const entry of scrapeSummary.failed) {
+    lines.push(`- ${entry.company} -> ${entry.reason}`);
+  }
+  return lines;
+}
+
+function formatDiscordLines(roles, scrapeSummary) {
+  const lines = [...buildRunSummary(roles.length, scrapeSummary)];
+  if (roles.length === 0) {
+    return [...lines, "", "No new target internships found this run.", ...formatFailureLines(scrapeSummary)];
+  }
+
+  lines.push("", "New target internships found:");
   const byCompany = roles.reduce((acc, role) => {
     if (!acc[role.company]) acc[role.company] = [];
     acc[role.company].push(role);
     return acc;
   }, {});
 
-  const lines = ["New internship postings found:"];
   for (const [company, companyRoles] of Object.entries(byCompany)) {
     lines.push(`**${company}**`);
     for (const role of companyRoles) {
       lines.push(`- ${role.title} -> ${role.url}`);
     }
   }
-  return lines;
+  return [...lines, ...formatFailureLines(scrapeSummary)];
 }
 
-async function sendDiscordNotification(newRoles, errors) {
-  const lines = formatDiscordLines(newRoles);
-  if (errors.length > 0) {
-    lines.push("");
-    lines.push(`Scrape errors (${errors.length}): ${errors.map((e) => e.company).join(", ")}`);
-  }
-  const body = { content: lines.join("\n").slice(0, 1900) };
+async function sendDiscordNotification(newRoles, scrapeSummary) {
+  const lines = formatDiscordLines(newRoles, scrapeSummary);
+  const body = { content: trimLines(lines).join("\n") };
   const response = await fetch(process.env.DISCORD_WEBHOOK_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -269,29 +363,19 @@ async function sendDiscordNotification(newRoles, errors) {
 }
 
 async function run() {
-  debugLog("H1", "src/index.js:273", "Monitor run entered", { nodeVersion: process.version });
   assertEnv();
-  debugLog("H2", "src/index.js:275", "Environment validation passed", {
-    hasNotionToken: Boolean(process.env.NOTION_TOKEN),
-    hasCompaniesDb: Boolean(process.env.NOTION_COMPANIES_DB_ID),
-    hasAppsDb: Boolean(process.env.NOTION_APPS_DB_ID),
-    hasDiscordWebhook: Boolean(process.env.DISCORD_WEBHOOK_URL)
-  });
   const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
   console.log("Loading companies and applications from Notion...");
-  const [companies, appliedKeys, seenKeys] = await Promise.all([
+  const [companies, applicationsIndex, seenKeys] = await Promise.all([
     loadCompanies(notion),
-    loadApplicationKeys(notion),
+    loadApplicationsIndex(notion),
     loadSeenState()
   ]);
-  debugLog("H3", "src/index.js:288", "Loaded Notion and state payload sizes", {
-    companiesCount: companies.length,
-    appliedKeysCount: appliedKeys.size,
-    seenKeysCount: seenKeys.size
-  });
   console.log(`Loaded ${companies.length} companies.`);
-  console.log(`Loaded ${appliedKeys.size} application keys and ${seenKeys.size} seen keys.`);
+  console.log(
+    `Loaded ${applicationsIndex.entries.length} applications, ${applicationsIndex.byUrl.size} app URLs, and ${seenKeys.size} seen keys.`
+  );
 
   const scrapeResults = [];
   for (const batch of chunk(companies, 4)) {
@@ -299,47 +383,36 @@ async function run() {
     scrapeResults.push(...resultBatch);
   }
 
-  const errors = scrapeResults.filter((item) => item.error).map((item) => ({ company: item.company, error: item.error }));
+  const scrapeSummary = summarizeScrapeResults(scrapeResults);
   const scrapedRoles = scrapeResults.flatMap((item) => item.roles);
-  console.log(`Scraped ${scrapedRoles.length} internship-like link candidates.`);
-  if (errors.length > 0) {
-    for (const entry of errors) console.warn(`Warning scraping ${entry.company}: ${entry.error}`);
+  console.log(`Scraped ${scrapedRoles.length} internship + tech link candidates.`);
+  if (scrapeSummary.failed.length > 0) {
+    for (const entry of scrapeSummary.failed) {
+      console.warn(`Warning scraping ${entry.company}: ${entry.reason}`);
+    }
   }
+  console.log(`Scrape success ratio: ${scrapeSummary.successfulCompanies}/${scrapeSummary.totalCompanies}`);
 
   const unique = new Map();
   for (const role of scrapedRoles) unique.set(roleKey(role), role);
   const dedupedRoles = [...unique.entries()].map(([key, role]) => ({ ...role, key }));
 
   const trulyNew = dedupedRoles.filter((role) => {
-    const byUrl = canonicalizeUrl(role.url);
-    const byCompanyAndTitle = `${normalizeText(role.company)}|${normalizeText(role.title)}`;
-    return !appliedKeys.has(byUrl) && !appliedKeys.has(byCompanyAndTitle) && !seenKeys.has(role.key);
+    return !isLikelyAppliedRole(role, applicationsIndex) && !seenKeys.has(role.key);
   });
 
   for (const role of dedupedRoles) seenKeys.add(role.key);
   await saveSeenState(seenKeys);
 
+  await sendDiscordNotification(trulyNew, scrapeSummary);
   if (trulyNew.length > 0) {
-    debugLog("H4", "src/index.js:322", "Preparing Discord alert for new roles", {
-      newRolesCount: trulyNew.length,
-      scrapeErrorCount: errors.length
-    });
-    await sendDiscordNotification(trulyNew, errors);
     console.log(`Sent Discord alert for ${trulyNew.length} new roles.`);
   } else {
-    console.log("No new roles found this run.");
-    if (errors.length > 0) {
-      await sendDiscordNotification([], errors);
-      console.log("Sent scrape error summary to Discord.");
-    }
+    console.log("No new roles found this run; sent summary to Discord.");
   }
 }
 
 run().catch((error) => {
-  debugLog("H5", "src/index.js:336", "Monitor run failed", {
-    errorMessage: String(error?.message || error),
-    errorName: error?.name || "UnknownError"
-  });
   console.error("Internship monitor failed:", error);
   process.exit(1);
 });
