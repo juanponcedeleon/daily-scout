@@ -1,0 +1,56 @@
+name: Internship Monitor
+
+on:
+  schedule:
+    # 15:00 UTC ~= 8:00 AM PDT
+    - cron: "0 15 * * *"
+    # 02:00 UTC ~= 7:00 PM PDT (previous local day in UTC)
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Ensure state file exists
+        run: |
+          if [ ! -f seen_jobs.json ]; then
+            echo '{"updatedAt": null, "seenKeys": []}' > seen_jobs.json
+          fi
+
+      - name: Run monitor
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_COMPANIES_DB_ID: ${{ secrets.NOTION_COMPANIES_DB_ID }}
+          NOTION_APPS_DB_ID: ${{ secrets.NOTION_APPS_DB_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: npm start
+
+      - name: Commit seen state updates
+        run: |
+          if git diff --quiet -- seen_jobs.json; then
+            echo "No seen state changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen_jobs.json
+          git commit -m "chore: update seen jobs state"
+          git push
