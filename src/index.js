@@ -38,6 +38,8 @@ const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RETRIES = 2;
 const USER_AGENT =
   "internship-monitor/1.0 (+https://github.com; free-notion-discord-monitor)";
+const DEBUG_ENDPOINT = "http://127.0.0.1:7684/ingest/74cc1cfb-b75f-4990-9811-1f44bafe5045";
+const DEBUG_SESSION_ID = "e13dca";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -110,11 +112,19 @@ async function fetchWithRetry(url, { timeoutMs = REQUEST_TIMEOUT_MS, retries = M
         }
       });
       clearTimeout(timeout);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        // #region agent log
+        fetch(DEBUG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "e13dca" }, body: JSON.stringify({ sessionId: DEBUG_SESSION_ID, runId: process.env.GITHUB_RUN_ID || "local-run", hypothesisId: "H1", location: "src/index.js:116", message: "HTTP non-OK response", data: { url, status: response.status, attempt, retries }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+        throw new Error(`HTTP ${response.status}`);
+      }
       return response;
     } catch (error) {
       clearTimeout(timeout);
       attempt += 1;
+      // #region agent log
+      fetch(DEBUG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "e13dca" }, body: JSON.stringify({ sessionId: DEBUG_SESSION_ID, runId: process.env.GITHUB_RUN_ID || "local-run", hypothesisId: "H2", location: "src/index.js:124", message: "Fetch attempt failed", data: { url, attempt, retries, errorName: error?.name || "UnknownError", errorMessage: String(error?.message || error), aborted: error?.name === "AbortError" }, timestamp: Date.now() }) }).catch(() => {});
+      // #endregion
       if (attempt > retries) throw error;
       await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
     }
@@ -254,6 +264,9 @@ function extractCandidateRoles(company, careersUrl, html) {
 
 async function scrapeCompanyJobs(company) {
   try {
+    // #region agent log
+    fetch(DEBUG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "e13dca" }, body: JSON.stringify({ sessionId: DEBUG_SESSION_ID, runId: process.env.GITHUB_RUN_ID || "local-run", hypothesisId: "H3", location: "src/index.js:268", message: "Starting company scrape", data: { company: company.company, careersUrl: company.careersUrl }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
     const response = await fetchWithRetry(company.careersUrl);
     const html = await response.text();
     return {
@@ -262,6 +275,9 @@ async function scrapeCompanyJobs(company) {
       error: null
     };
   } catch (error) {
+    // #region agent log
+    fetch(DEBUG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "e13dca" }, body: JSON.stringify({ sessionId: DEBUG_SESSION_ID, runId: process.env.GITHUB_RUN_ID || "local-run", hypothesisId: "H4", location: "src/index.js:279", message: "Company scrape failed", data: { company: company.company, careersUrl: company.careersUrl, errorName: error?.name || "UnknownError", errorMessage: String(error?.message || error) }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
     return {
       company: company.company,
       roles: [],
