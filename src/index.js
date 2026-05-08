@@ -34,12 +34,74 @@ const TECH_KEYWORDS = [
   "systems"
 ];
 const TITLE_SIMILARITY_THRESHOLD = 0.5;
+const LOCATION_CONTEXT_MAX_CHARS = 300;
+const PARENT_CONTEXT_WALK = 2;
+/** Phrases (normalized substring) — multi-word or unlikely to appear inside US place names */
+const NON_US_MULTIWORD_PHRASES = [
+  "united kingdom",
+  "great britain",
+  "northern ireland",
+  "czech republic",
+  "south korea",
+  "hong kong",
+  "sri lanka",
+  "new zealand",
+  "united arab emirates",
+  "south africa",
+  "asia pacific",
+  "latin america",
+  "middle east",
+  "americas excluding",
+  "peoples republic of china",
+  "pr china",
+  "nova scotia",
+  "costa rica",
+  "dominican republic",
+  "el salvador",
+  "south sudan"
+];
+/** Rare-in-English tokens that still clearly mean a non-US place */
+const NON_US_LOCATION_TOKENS = new Set(["uk"]);
+/** Unambiguous non-US cities (whole-token match on normalized text) */
+const NON_US_CITY_TOKENS = new Set([
+  "toronto",
+  "vancouver",
+  "montreal",
+  "calgary",
+  "ottawa",
+  "mississauga",
+  "berlin",
+  "munich",
+  "frankfurt",
+  "hamburg",
+  "bangalore",
+  "bengaluru",
+  "hyderabad",
+  "pune",
+  "chennai",
+  "mumbai",
+  "delhi",
+  "shanghai",
+  "beijing",
+  "shenzhen",
+  "tokyo",
+  "osaka",
+  "seoul",
+  "sydney",
+  "melbourne",
+  "zurich",
+  "amsterdam",
+  "warsaw",
+  "prague",
+  "barcelona",
+  "madrid",
+  "lisbon",
+  "telaviv"
+]);
 const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RETRIES = 2;
 const USER_AGENT =
   "internship-monitor/1.0 (+https://github.com; free-notion-discord-monitor)";
-const DEBUG_ENDPOINT = "http://127.0.0.1:7684/ingest/74cc1cfb-b75f-4990-9811-1f44bafe5045";
-const DEBUG_SESSION_ID = "e13dca";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -113,18 +175,12 @@ async function fetchWithRetry(url, { timeoutMs = REQUEST_TIMEOUT_MS, retries = M
       });
       clearTimeout(timeout);
       if (!response.ok) {
-        // #region agent log
-        fetch(DEBUG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "e13dca" }, body: JSON.stringify({ sessionId: DEBUG_SESSION_ID, runId: process.env.GITHUB_RUN_ID || "local-run", hypothesisId: "H1", location: "src/index.js:116", message: "HTTP non-OK response", data: { url, status: response.status, attempt, retries }, timestamp: Date.now() }) }).catch(() => {});
-        // #endregion
         throw new Error(`HTTP ${response.status}`);
       }
       return response;
     } catch (error) {
       clearTimeout(timeout);
       attempt += 1;
-      // #region agent log
-      fetch(DEBUG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "e13dca" }, body: JSON.stringify({ sessionId: DEBUG_SESSION_ID, runId: process.env.GITHUB_RUN_ID || "local-run", hypothesisId: "H2", location: "src/index.js:124", message: "Fetch attempt failed", data: { url, attempt, retries, errorName: error?.name || "UnknownError", errorMessage: String(error?.message || error), aborted: error?.name === "AbortError" }, timestamp: Date.now() }) }).catch(() => {});
-      // #endregion
       if (attempt > retries) throw error;
       await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
     }
@@ -229,6 +285,154 @@ function isTargetRoleTitle(text) {
   return containsInternKeyword(text) && containsTechKeyword(text);
 }
 
+function isClearlyUnitedStatesContext(normalized) {
+  if (!normalized) return false;
+  if (normalized.includes("new england")) return true;
+  if (normalized.includes("new mexico")) return true;
+  if (normalized.includes("china lake")) return true;
+  if (normalized.includes("united states")) return true;
+  if (normalized.includes("puerto rico")) return true;
+  if (normalized.includes("district of columbia")) return true;
+  if (normalized.includes("washington dc")) return true;
+  return false;
+}
+
+function hasNonUsMexico(normalized) {
+  if (!normalized.includes("mexico")) return false;
+  if (normalized.includes("new mexico")) return false;
+  return true;
+}
+
+/** Returns true only when text clearly indicates not US; ambiguous → false (keep role). */
+function isClearlyNonUnitedStates(rawContext) {
+  const normalized = normalizeText(rawContext);
+  if (!normalized) return false;
+  if (isClearlyUnitedStatesContext(normalized)) return false;
+
+  if (hasNonUsMexico(normalized)) return true;
+
+  const tokens = tokenize(rawContext);
+
+  if (tokens.has("usa")) return false;
+
+  for (const word of NON_US_LOCATION_TOKENS) {
+    if (tokens.has(word)) return true;
+  }
+
+  for (const city of NON_US_CITY_TOKENS) {
+    if (tokens.has(city)) return true;
+  }
+
+  if (tokens.has("england") && !normalized.includes("new england")) return true;
+
+  const tokenCountries = new Set([
+    "ireland",
+    "germany",
+    "france",
+    "spain",
+    "italy",
+    "netherlands",
+    "holland",
+    "sweden",
+    "norway",
+    "finland",
+    "denmark",
+    "scotland",
+    "wales",
+    "switzerland",
+    "austria",
+    "belgium",
+    "poland",
+    "portugal",
+    "greece",
+    "romania",
+    "hungary",
+    "czechia",
+    "slovakia",
+    "japan",
+    "korea",
+    "singapore",
+    "taiwan",
+    "vietnam",
+    "philippines",
+    "thailand",
+    "indonesia",
+    "malaysia",
+    "bangladesh",
+    "pakistan",
+    "australia",
+    "brazil",
+    "argentina",
+    "chile",
+    "colombia",
+    "israel",
+    "russia",
+    "ukraine",
+    "nigeria",
+    "kenya",
+    "egypt",
+    "qatar",
+    "uae",
+    "dubai",
+    "saudi",
+    "europe",
+    "european",
+    "africa",
+    "emea",
+    "apac",
+    "mea",
+    "iceland",
+    "morocco",
+    "tunisia",
+    "venezuela",
+    "ecuador",
+    "jamaica",
+    "cuba",
+    "iran",
+    "iraq",
+    "nepal",
+    "bhutan",
+    "mongolia",
+    "cambodia",
+    "myanmar",
+    "fiji",
+    "turkey"
+  ]);
+  for (const c of tokenCountries) {
+    if (tokens.has(c)) return true;
+  }
+
+  for (const phrase of NON_US_MULTIWORD_PHRASES) {
+    if (normalized.includes(phrase)) return true;
+  }
+  return false;
+}
+
+function buildLocationContext($, element, linkText) {
+  const parts = [];
+  const push = (value) => {
+    if (!value) return;
+    const trimmed = String(value).replace(/\s+/g, " ").trim();
+    if (trimmed) parts.push(trimmed);
+  };
+  push(linkText);
+  push($(element).attr("aria-label"));
+  push($(element).attr("title"));
+  let node = element;
+  for (let depth = 0; depth < PARENT_CONTEXT_WALK; depth++) {
+    const parent = $(node).parent().get(0);
+    if (!parent || !parent.tagName) break;
+    const raw = $(parent).text().replace(/\s+/g, " ").trim();
+    if (raw) push(raw.slice(0, 200));
+    node = parent;
+  }
+  let combined = parts.join(" ");
+  if (combined.length > LOCATION_CONTEXT_MAX_CHARS) {
+    combined = combined.slice(0, LOCATION_CONTEXT_MAX_CHARS);
+  }
+  return combined;
+}
+
 function roleKey(role) {
   return `${normalizeText(role.company)}|${normalizeText(role.title)}|${canonicalizeUrl(role.url)}`;
 }
@@ -251,36 +455,39 @@ function isLikelyAppliedRole(role, applicationsIndex) {
 function extractCandidateRoles(company, careersUrl, html) {
   const $ = loadHtml(html);
   const results = [];
+  let nonUsFiltered = 0;
   $("a").each((_, element) => {
     const title = $(element).text().replace(/\s+/g, " ").trim();
     const href = $(element).attr("href");
     if (!title || !href) return;
     if (!isTargetRoleTitle(title)) return;
+    const context = buildLocationContext($, element, title);
+    if (isClearlyNonUnitedStates(context)) {
+      nonUsFiltered += 1;
+      return;
+    }
     const absolute = new URL(href, careersUrl).toString();
     results.push({ company, title, url: absolute });
   });
-  return results;
+  return { roles: results, nonUsFiltered };
 }
 
 async function scrapeCompanyJobs(company) {
   try {
-    // #region agent log
-    fetch(DEBUG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "e13dca" }, body: JSON.stringify({ sessionId: DEBUG_SESSION_ID, runId: process.env.GITHUB_RUN_ID || "local-run", hypothesisId: "H3", location: "src/index.js:268", message: "Starting company scrape", data: { company: company.company, careersUrl: company.careersUrl }, timestamp: Date.now() }) }).catch(() => {});
-    // #endregion
     const response = await fetchWithRetry(company.careersUrl);
     const html = await response.text();
+    const extracted = extractCandidateRoles(company.company, company.careersUrl, html);
     return {
       company: company.company,
-      roles: extractCandidateRoles(company.company, company.careersUrl, html),
+      roles: extracted.roles,
+      nonUsFiltered: extracted.nonUsFiltered,
       error: null
     };
   } catch (error) {
-    // #region agent log
-    fetch(DEBUG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "e13dca" }, body: JSON.stringify({ sessionId: DEBUG_SESSION_ID, runId: process.env.GITHUB_RUN_ID || "local-run", hypothesisId: "H4", location: "src/index.js:279", message: "Company scrape failed", data: { company: company.company, careersUrl: company.careersUrl, errorName: error?.name || "UnknownError", errorMessage: String(error?.message || error) }, timestamp: Date.now() }) }).catch(() => {});
-    // #endregion
     return {
       company: company.company,
       roles: [],
+      nonUsFiltered: 0,
       error: String(error?.message || error)
     };
   }
@@ -401,7 +608,9 @@ async function run() {
 
   const scrapeSummary = summarizeScrapeResults(scrapeResults);
   const scrapedRoles = scrapeResults.flatMap((item) => item.roles);
+  const nonUsFilteredTotal = scrapeResults.reduce((sum, item) => sum + (item.nonUsFiltered || 0), 0);
   console.log(`Scraped ${scrapedRoles.length} internship + tech link candidates.`);
+  console.log(`Filtered out ${nonUsFilteredTotal} candidates with clear non-US location text.`);
   if (scrapeSummary.failed.length > 0) {
     for (const entry of scrapeSummary.failed) {
       console.warn(`Warning scraping ${entry.company}: ${entry.reason}`);
