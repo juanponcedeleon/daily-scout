@@ -408,6 +408,20 @@ function isClearlyNonUnitedStates(rawContext) {
   return false;
 }
 
+function classifyLocationContext(rawContext) {
+  const normalized = normalizeText(rawContext);
+  if (!normalized) {
+    return { locationLabel: "Unknown/Unclear", locationContext: "" };
+  }
+  if (isClearlyUnitedStatesContext(normalized)) {
+    return { locationLabel: "US", locationContext: rawContext };
+  }
+  if (isClearlyNonUnitedStates(rawContext)) {
+    return { locationLabel: "Non-US", locationContext: rawContext };
+  }
+  return { locationLabel: "Unknown/Unclear", locationContext: rawContext };
+}
+
 function buildLocationContext($, element, linkText) {
   const parts = [];
   const push = (value) => {
@@ -455,21 +469,22 @@ function isLikelyAppliedRole(role, applicationsIndex) {
 function extractCandidateRoles(company, careersUrl, html) {
   const $ = loadHtml(html);
   const results = [];
-  let nonUsFiltered = 0;
+  const locationCounts = { us: 0, nonUs: 0, unknown: 0 };
   $("a").each((_, element) => {
     const title = $(element).text().replace(/\s+/g, " ").trim();
     const href = $(element).attr("href");
     if (!title || !href) return;
     if (!isTargetRoleTitle(title)) return;
     const context = buildLocationContext($, element, title);
-    if (isClearlyNonUnitedStates(context)) {
-      nonUsFiltered += 1;
-      return;
-    }
+    const { locationLabel, locationContext } = classifyLocationContext(context);
+    if (locationLabel === "US") locationCounts.us += 1;
+    else if (locationLabel === "Non-US") locationCounts.nonUs += 1;
+    else locationCounts.unknown += 1;
+
     const absolute = new URL(href, careersUrl).toString();
-    results.push({ company, title, url: absolute });
+    results.push({ company, title, url: absolute, locationLabel, locationContext });
   });
-  return { roles: results, nonUsFiltered };
+  return { roles: results, locationCounts };
 }
 
 async function scrapeCompanyJobs(company) {
@@ -480,14 +495,14 @@ async function scrapeCompanyJobs(company) {
     return {
       company: company.company,
       roles: extracted.roles,
-      nonUsFiltered: extracted.nonUsFiltered,
+      locationCounts: extracted.locationCounts,
       error: null
     };
   } catch (error) {
     return {
       company: company.company,
       roles: [],
-      nonUsFiltered: 0,
+      locationCounts: { us: 0, nonUs: 0, unknown: 0 },
       error: String(error?.message || error)
     };
   }
@@ -568,7 +583,7 @@ function formatDiscordLines(roles, scrapeSummary) {
   for (const [company, companyRoles] of Object.entries(byCompany)) {
     lines.push(`**${company}**`);
     for (const role of companyRoles) {
-      lines.push(`- ${role.title} -> ${role.url}`);
+      lines.push(`- ${role.title} [Location: ${role.locationLabel || "Unknown/Unclear"}] -> ${role.url}`);
     }
   }
   return [...lines, ...formatFailureLines(scrapeSummary)];
@@ -608,9 +623,19 @@ async function run() {
 
   const scrapeSummary = summarizeScrapeResults(scrapeResults);
   const scrapedRoles = scrapeResults.flatMap((item) => item.roles);
-  const nonUsFilteredTotal = scrapeResults.reduce((sum, item) => sum + (item.nonUsFiltered || 0), 0);
+  const locationTotals = scrapeResults.reduce(
+    (sum, item) => {
+      sum.us += item.locationCounts?.us || 0;
+      sum.nonUs += item.locationCounts?.nonUs || 0;
+      sum.unknown += item.locationCounts?.unknown || 0;
+      return sum;
+    },
+    { us: 0, nonUs: 0, unknown: 0 }
+  );
   console.log(`Scraped ${scrapedRoles.length} internship + tech link candidates.`);
-  console.log(`Filtered out ${nonUsFilteredTotal} candidates with clear non-US location text.`);
+  console.log(
+    `Location labels across candidates: US=${locationTotals.us}, Non-US=${locationTotals.nonUs}, Unknown/Unclear=${locationTotals.unknown}.`
+  );
   if (scrapeSummary.failed.length > 0) {
     for (const entry of scrapeSummary.failed) {
       console.warn(`Warning scraping ${entry.company}: ${entry.reason}`);

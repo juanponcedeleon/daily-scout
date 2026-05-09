@@ -7,4 +7,4 @@ Twice a day, this project:
 - removes previously seen roles
 - sends only new matches to Discord
 - always includes scrape reliability in notification (`successful/total`) plus failed-company reasons
-- drops roles only when link/context text clearly indicates a non-US location; if location is missing or unclear, the role is kept
+- keeps roles regardless of location and labels each role as `US`, `Non-US`, or `Unknown/Unclear` in notifications
