@@ -8,3 +8,4 @@ Twice a day, this project:
 - sends only new matches to Discord
 - always includes scrape reliability in notification (`successful/total`) plus failed-company reasons
 - keeps roles regardless of location and labels each role as `US`, `Non-US`, or `Unknown/Unclear` in notifications
+- automatically applies when an internship is found
